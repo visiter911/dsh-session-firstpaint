@@ -1,0 +1,36 @@
+{
+  "name": "dsh-session-firstpaint",
+  "version": "0.2.0",
+  "type": "module",
+  "license": "MIT",
+  "description": "冷会话首屏尾部优先读取 + 首屏预缓存：只解压日志尾部若干 zstd 帧就交出首屏快照，完整读取转到后台，卸载即还原",
+  "keywords": [
+    "dsh-bundle",
+    "session",
+    "first-paint",
+    "zstd",
+    "performance"
+  ],
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "lib/*.js",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node test.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

@@ -1,0 +1,12 @@
+# Session First Paint — bundle patch
+#
+# 由 profile 的 dsh.profile.bundles 引入，insert 一个 host 插件。
+# 插件不改任何包文件：启动后替换 SessionController.prototype.follow，
+# 冷会话只解压日志尾部的 zstd 帧就交出首屏，完整读取转后台。
+#
+# 临时停用（不卸载）：在 profile 的 cordis.patch.yml 里加
+#   - id: session-firstpaint
+#     disabled: true
+- insert:
+    - id: session-firstpaint
+      name: dsh-session-firstpaint
