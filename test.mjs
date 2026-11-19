@@ -91,7 +91,7 @@ function makeHarness({ cold, tailPath, header, originalFrames, config }) {
 
 const dir = mkdtempSync(join(tmpdir(), 'firstpaint-'))
 try {
-  const header = { version: 4, id: 'session-test', createdAt: 1, cwd: '/work', isSeeded: false, delegationDepth: 0 }
+  const header = { version: 4, id: 'session-test', createdAt: 1, cwd: 'G:\\x', isSeeded: false, delegationDepth: 0 }
   const events = makeEvents(300)
   // 每 20 个事件一帧，模拟真实分帧。
   const frames = []
@@ -299,5 +299,4 @@ try {
 
 console.log(failures === 0 ? '\n全部通过' : `\n${failures} 项失败`)
 process.exit(failures === 0 ? 0 : 1)
-
 

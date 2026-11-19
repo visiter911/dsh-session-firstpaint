@@ -29,6 +29,8 @@ import { sampleOnce } from './lib/sample.js'
 import { installFastLoad } from './lib/fast-load.js'
 import { installQueryFastPath } from './lib/query-fast.js'
 import { installPrefetch, PREFETCH_DEFAULTS } from './lib/prefetch.js'
+import { installHistoryCap } from './lib/history-cap.js'
+import { installMemoBudget, MEMO_BUDGET_DEFAULTS } from './lib/memo-budget.js'
 
 export const name = 'session-firstpaint'
 
@@ -102,8 +104,45 @@ function flushDiag() {
   }
 }
 
+/**
+ * 近期业务事件轨迹：回答「卡顿时正在干什么」。
+ *
+ * heap 数字只能说明「涨了」，不能说明「谁在分配」。
+ * 卡顿往往发生在一次长同步工作的中间，那时没有任何日志产出，
+ * 所以要把**卡顿之前**最后几条业务日志留下来，附在 STALL 行上。
+ *
+ * 只保留最近 12 条、跳过 STALL/GC 自身（否则轨迹会被观测自己的输出淹没）。
+ */
+const trailRing = []
+const TRAIL_MAX = 12
+
+/** 记录一条业务事件（第一段标识即可，足够定位阶段）。 */
+function noteTrail(label) {
+  trailRing.push({ at: Date.now(), label })
+  if (trailRing.length > TRAIL_MAX) trailRing.shift()
+}
+
+/**
+ * 读出卡顿前的业务轨迹。
+ *
+ * @returns {Array<{at: string, label: string}>} 相对时刻 + 标签，最旧在前。
+ */
+function readTrail() {
+  const now = Date.now()
+  return trailRing.map(item => ({
+    // 用「距今多久」表示：卡顿时刻往回数，比绝对时刻更好读。
+    at: `-${Math.max(0, now - item.at)}ms`,
+    label: item.label,
+  }))
+}
+
 /** 追加一行诊断（纯内存操作，调用方可以放心放在关键路径上）。 */
 function diag(line) {
+  // 观测自身的输出不进轨迹，否则会把自己淹没。
+  if (!line.startsWith('STALL ') && !line.startsWith('GC ')) {
+    const space = line.indexOf(' ')
+    noteTrail(space < 0 ? line : line.slice(0, space))
+  }
   diagBuffer.push(`${new Date().toISOString()} ${line}\n`)
   if (diagBuffer.length > 512) diagBuffer.splice(0, diagBuffer.length - 512)
   if (diagFlushTimer !== null) return
@@ -329,6 +368,32 @@ function resolvePrefetchBudget(config) {
 }
 
 /**
+ * 解码缓存的内存预算（字节）。
+ * @param {object | undefined} config - 插件配置。
+ * @returns {number} 正整数字节数。
+ */
+function resolveMemoBudget(config) {
+  const mb = config?.memoBudgetMb
+  if (typeof mb === 'number' && Number.isSafeInteger(mb) && mb > 0) {
+    return mb * 1024 * 1024
+  }
+  return MEMO_BUDGET_DEFAULTS.budgetBytes
+}
+
+/**
+ * 解码缓存的堆压力高水位（字节）。
+ * @param {object | undefined} config - 插件配置。
+ * @returns {number} 正整数字节数。
+ */
+function resolveMemoHighWater(config) {
+  const mb = config?.memoHeapHighWaterMb
+  if (typeof mb === 'number' && Number.isSafeInteger(mb) && mb > 0) {
+    return mb * 1024 * 1024
+  }
+  return MEMO_BUDGET_DEFAULTS.heapHighWaterBytes
+}
+
+/**
  * 读取首屏条数上限。配置从 apply(ctx, config) 传进来，绝不读 ctx.config：
  * 那是 Cordis 的受 inject 校验访问器，本插件没 inject 'config'，
  * 直接访问会抛 "cannot get property config without inject"。
@@ -385,6 +450,101 @@ function makeLog(ctx) {
 }
 
 /**
+ * 当前活跃的打开请求。
+ *
+ * 用户快速切换会话时，旧会话的完整读取仍在后台跑（那是秒级的同步解码）。
+ * 新请求进来时先把上一个中止掉，让 zstd 解码循环在下一个
+ * `throwIfAborted()` 检查点退出，把主线程让给新的那一页。
+ *
+ * 只记录**本插件发起的**调用：客户端自己的 signal 不在这里，
+ * 中止一个 follow 只影响我们包装过的那条迭代链。
+ */
+let activeOpen = undefined
+
+/**
+ * 切换爆发的合并统计。
+ *
+ * 连按方向键翻会话列表时，`follow` 每秒能跑 5 次左右。
+ * 每次打印 3 行诊断，2 分 44 秒就能刷出 2571 行——诊断本身成了开销，
+ * 也把真正有用的慢日志淹没了。
+ *
+ * 所以这里只做累加，由 `logBurst` 在爆发结束后合并成一行。
+ */
+const burst = {
+  warm: 0,
+  warmOpen: 0,
+  cancelled: 0,
+  firstMsSum: 0,
+  firstMsMax: 0,
+  firstMsCount: 0,
+  windowStart: 0,
+}
+
+/** 最近一次热开的结果，供爆发结束时的汇总行引用。 */
+let latestWarmOpen = undefined
+
+/** 爆发窗口：超过这么久没有新动作，就认为一次浏览结束并输出汇总。 */
+const BURST_IDLE_MS = 2000
+
+/** 正在等待输出的定时器。 */
+let burstTimer = null
+
+/**
+ * 记一次切换活动。
+ * @param {'warm' | 'warmOpen' | 'cancelled'} kind - 活动类型。
+ * @param {number | undefined} firstMs - 热开首帧耗时。
+ * @param {number | undefined} records - 首帧记录数。
+ */
+function noteFire(kind, firstMs, records) {
+  const now = Date.now()
+  if (burst.windowStart === 0) burst.windowStart = now
+  burst[kind] += 1
+  if (firstMs !== undefined) {
+    burst.firstMsSum += firstMs
+    burst.firstMsCount += 1
+    if (firstMs > burst.firstMsMax) burst.firstMsMax = firstMs
+  }
+  void records
+  if (burstTimer !== null) clearTimeout(burstTimer)
+  burstTimer = setTimeout(flushBurst, BURST_IDLE_MS)
+  if (typeof burstTimer.unref === 'function') burstTimer.unref()
+}
+
+/**
+ * 输出一次浏览爆发的汇总。
+ *
+ * 只在真正发生过切换时输出；空闲时什么都不写。
+ */
+function flushBurst() {
+  burstTimer = null
+  const total = burst.warm + burst.cancelled
+  if (total === 0) {
+    burst.windowStart = 0
+    return
+  }
+  const seconds = Math.max(0.001, (Date.now() - burst.windowStart) / 1000)
+  const avg = burst.firstMsCount === 0 ? 0 : burst.firstMsSum / burst.firstMsCount
+  const last = latestWarmOpen
+  diag(
+    `WARM-BURST switches=${total} opened=${burst.warmOpen} cancelled=${burst.cancelled}`
+    + ` ${seconds.toFixed(1)}s (${(total / seconds).toFixed(1)}/s)`
+    + ` first avg=${avg.toFixed(0)}ms max=${burst.firstMsMax}ms`
+    + (last === undefined ? '' : ` last=${last.sessionId} ${last.firstMs}ms`)
+    + ` cap=${burstCap}`,
+  )
+  burst.warm = 0
+  burst.warmOpen = 0
+  burst.cancelled = 0
+  burst.firstMsSum = 0
+  burst.firstMsMax = 0
+  burst.firstMsCount = 0
+  burst.windowStart = 0
+}
+
+/** 爆发汇总行里回显的消息上限，便于对照。 */
+let burstCap = DEFAULT_MAX_MESSAGES
+
+/**
  * 替换 prototype 上的 follow，返回还原函数。
  * @param {object} ctx - 插件上下文（含三个注入服务）。
  * @param {object | undefined} config - 插件配置（由 apply 传入，不能读 ctx.config）。
@@ -415,6 +575,67 @@ function installPatch(ctx, config, prefetch) {
     const sessionId = addressSessionId(request?.address)
     const cold = sessionId !== undefined && ctx.sessions.get(sessionId) === undefined
 
+    // ---- 只在「还有昂贵后台工作」时才驱逐上一个 ----
+    //
+    // `follow` 是持久订阅，不是一次性请求：首帧交出后它还要一直开着收新事件。
+    // 之前无条件 abort 上一个，导致热会话刚出首帧（1~2ms）就被 40ms 后的
+    // 下一次切换中断（实测 CANCEL-STALE 紧跟在 WARM-OPEN 后面），
+    // 客户端那条流提前结束、来不及渲染，界面看着像「没切换成功」。
+    //
+    // 所以只在这两种情况下中断：
+    //   1. 上一次还没交出首帧（settled=false）——避免无谓启动；
+    //   2. 上一次是冷会话——它首帧之后还有秒级的完整解码在抢主线程。
+    // 热会话已出首帧时**不中断**：那没有昂贵后台工作，中断只会破坏渲染。
+    if (sessionId !== undefined) {
+      const previous = activeOpen
+      const worthEvicting = previous !== undefined
+        && previous.sessionId !== sessionId
+        && previous.controller.signal.aborted === false
+        && (previous.settled === false || previous.cold === true)
+      if (worthEvicting) {
+        noteFire('cancelled')
+        previous.controller.abort(new Error('superseded by another session open'))
+      }
+      const controller = new AbortController()
+      const entry = { sessionId, controller, cold, settled: false }
+      activeOpen = entry
+      try {
+        yield* followBody.call(this, request, signal, controller.signal, cold, entry)
+      } finally {
+        // 只有仍是最新那个才清空，避免把后来者清掉。
+        if (activeOpen === entry) activeOpen = undefined
+      }
+      return
+    }
+    yield* followBody.call(this, request, signal, undefined, cold, undefined)
+  }
+
+  /**
+   * follow 的实际实现。
+   * @param {object} request - 原始请求。
+   * @param {AbortSignal | undefined} signal - 客户端取消信号。
+   * @param {AbortSignal | undefined} cancelSignal - 本插件的中止信号（被新会话取代时触发）。
+   * @param {boolean} cold - 是否冷会话。
+   * @param {object | undefined} entry - 活跃请求记录，交出首帧后标记 settled。
+   */
+  async function* followBody(request, signal, cancelSignal, cold, entry) {
+    const sessionId = addressSessionId(request?.address)
+    /**
+     * 合并后的取消信号。
+     *
+     * 必须把插件的 `cancelSignal` 并进真实的 signal 再交给原实现：
+     * 宿主内部（`readZstdPrefix` 的解压循环）检查的是它收到的那个 signal，
+     * 只在 `yield* original.call(this, request, signal)` 里传客户端 signal
+     * 的话，「被新会话取代」永远不会传达到解码循环。
+     */
+    const merged = signal === undefined
+      ? cancelSignal
+      : cancelSignal === undefined
+        ? signal
+        : AbortSignal.any([signal, cancelSignal])
+    /** 两个信号任一触发就算中止。 */
+    const aborted = () => signal?.aborted === true || cancelSignal?.aborted === true
+
     // 上限值：冷热共用同一个配置，保证两条路径的可感受延迟一致。
     const cap = resolveMaxMessages(config)
 
@@ -425,18 +646,21 @@ function installPatch(ctx, config, prefetch) {
     const windowed = capFromRequest(request, cap)
     if (!cold && windowed !== request) {
       const tWarm = Date.now()
-      diag(
-        `WARM ${sessionId} cap=${cap}`
-        + ` maxMessages=${request.maxMessages ?? '-'}->${windowed.maxMessages}`
-        + ` turnWindow=${request.turnWindow?.minMessages ?? '-'}/${request.turnWindow?.minTurns ?? '-'}->去掉`,
-      )
-      startLagMonitor(sessionId)
+      burstCap = cap
+      // 连按方向键时这里每秒会跑好几次，逐次打印会让日志量翻几倍
+      // （实测 2 分 44 秒刷了 857 组三行）。改成累计，爆发结束后合并输出。
+      noteFire('warm')
       let first = true
-      for await (const frame of original.call(this, windowed, signal)) {
+      for await (const frame of original.call(this, windowed, merged)) {
         if (first) {
           first = false
+          const firstMs = Date.now() - tWarm
           const records = frame?.type === 'snapshot' ? (frame.records?.length ?? 0) : 0
-          diag(`WARM-OPEN ${sessionId} first=${Date.now() - tWarm}ms records=${records} cursor=${frame?.cursor ?? '-'}`)
+          noteFire('warmOpen', firstMs, records)
+          latestWarmOpen = { sessionId, firstMs, records, at: Date.now() }
+          // 首帧已交出：热会话此后不再有昂贵后台工作，标记 settled，
+          // 后续切换就不会再来 abort 这条流（否则界面刚渲染就被打断）。
+          if (entry !== undefined) entry.settled = true
         }
         yield frame
       }
@@ -456,7 +680,7 @@ function installPatch(ctx, config, prefetch) {
       let inner
       let pending
       try {
-        inner = original.call(this, request, signal)[Symbol.asyncIterator]()
+        inner = original.call(this, request, merged)[Symbol.asyncIterator]()
         pending = inner.next()
         // 立刻观察拒绝，避免未处理拒绝。
         void pending.catch(() => undefined)
@@ -468,7 +692,8 @@ function installPatch(ctx, config, prefetch) {
 
       let snapshot
       try {
-        snapshot = await tryTailFirst(ctx, sessionId, log, config, prefetch, signal)
+        // 把插件的取消信号一起传下去：尾部读内部的解压循环会检查它。
+        snapshot = await tryTailFirst(ctx, sessionId, log, config, prefetch, cancelSignal ?? signal)
       } catch (error) {
         log(`尾部读取异常，退回原实现：${String(error)}`)
         diag(`MISS tail-threw ${sessionId} ${String(error)}`)
@@ -479,14 +704,20 @@ function installPatch(ctx, config, prefetch) {
         if (snapshot !== undefined) {
           diag(`EMIT ${sessionId} firstpaint=${Date.now() - tFollow}ms`)
           const tEmit = Date.now()
+          // 冷会话首帧交出后**仍然**标记 settled，但它 `cold=true`，
+          // 驱逐判定里依然会被中断——因为首帧之后还有秒级的完整解码
+          // 在抢主线程，那才是必须打断的部分。
+          if (entry !== undefined) entry.settled = true
           yield snapshot
           try {
             // 丢弃原实现那份等价 opening（cursor 与上面同一个尾部 seq）。
             const opening = await pending
             diag(`OPENING ${sessionId} resumeWatch=${Date.now() - tEmit}ms afterEmit total=${Date.now() - tFollow}ms cursor=${opening.done === true ? 'done' : opening.value?.cursor}`)
             if (opening.done === true) return
+            // 首屏之后的完整读取是最贵的一段（秒级同步解码）。
+            // 一旦被新会话取代就立刻退出，不要继续抢主线程。
             for (;;) {
-              if (signal?.aborted === true) return
+              if (aborted()) return
               const next = await inner.next()
               if (next.done === true) return
               yield next.value
@@ -502,7 +733,7 @@ function installPatch(ctx, config, prefetch) {
           if (first.done === true) return
           yield first.value
           for (;;) {
-            if (signal?.aborted === true) return
+            if (aborted()) return
             const next = await inner.next()
             if (next.done === true) return
             yield next.value
@@ -514,7 +745,7 @@ function installPatch(ctx, config, prefetch) {
       }
     }
 
-    yield* original.call(this, request, signal)
+    yield* original.call(this, request, merged)
   }
 
   Object.defineProperty(proto, 'follow', {
@@ -576,6 +807,42 @@ export function apply(ctx, config) {
     'session-firstpaint: prefetch',
   )
   ctx.effect(() => installPatch(ctx, config, prefetch), 'session-firstpaint: follow patch')
+  // 解码缓存扩容：宿主写死只缓存 2 个会话，切第三个就挤出第一个，
+  // 切回来又要 2~4 秒重新解码。这里换成字节预算 + LRU（默认 900 MB）。
+  // 必须在任何会话被打开之前装好，否则早期解码进不了新策略。
+  let memoBudget = { stop() {}, stats() { return {} } }
+  ctx.effect(
+    () => {
+      memoBudget = installMemoBudget({
+        persistence: ctx.sessionPersistence,
+        diag,
+        budgetBytes: resolveMemoBudget(config),
+        heapHighWaterBytes: resolveMemoHighWater(config),
+      })
+      return () => {
+        memoBudget.stop()
+        memoBudget = { stop() {}, stats() { return {} } }
+      }
+    },
+    'session-firstpaint: memo budget',
+  )
+  // 翻历史那一页不经过 follow：客户端 loadOlder 自带
+  // `maxMessages: 500 + turnWindow.minTurns: 2`，实测一页搬 300~1188 条、
+  // 0.7~2.9 MB。
+  //
+  // 2026-11-20：改写默认关闭。理由见 lib/history-cap.js 顶部——客户端的
+  // `native` 消费分支不做锚点补偿，只依赖 `overflow-anchor`，而该属性在
+  // 滚动动效激活时被置为 `none`；两者叠加时改写页长会让内容跳动。
+  // 现在这里只保留每页耗时/体积计时，回包原样透传。
+  ctx.effect(
+    () => installHistoryCap({
+      sessionController: ctx.sessionController,
+      pageEvents: config?.historyPageEvents,
+      rewrite: config?.historyRewrite === true,
+      diag,
+    }),
+    'session-firstpaint: history page cap',
+  )
   // 分段计时补丁：只读计时，不改变任何行为，用来定位冷读的各段耗时。
   ctx.effect(
     () => installProfile({
@@ -598,7 +865,7 @@ export function apply(ctx, config) {
   // 消除 snapshotLive 的全量深拷贝：实测一次 33 MB 会话要克隆 43950 个事件，
   // 花掉 1.4～2.2 秒、多占 418 MB 堆，而这些事件本来就是 deepFreeze 过的不可变值。
   ctx.effect(
-    () => installFastLoad({ sessionQuery: ctx.sessionQuery, diag }),
+    () => installFastLoad({ sessionQuery: ctx.sessionQuery, persistence: ctx.sessionPersistence, diag }),
     'session-firstpaint: shared load',
   )
   // 消除 sessionQuery 上两处纯浪费：
@@ -620,6 +887,7 @@ export function apply(ctx, config) {
       diag,
       stallMs: config?.stallThresholdMs,
       gcMs: config?.gcThresholdMs,
+      trail: readTrail,
     }),
     'session-firstpaint: stall attribution',
   )
@@ -639,10 +907,11 @@ export function apply(ctx, config) {
     )
   }
   // 插件装载/重载时留一条记录，用来确认磁盘上的新代码确实被加载了。
-  diag(`INSTALL maxMessages=${resolveMaxMessages(config)} segmented=yes stallWatch=yes profile=yes sample=${config?.sample === true ? 'on' : 'off'}`)
+  diag(`INSTALL maxMessages=${resolveMaxMessages(config)} segmented=yes stallWatch=yes profile=yes memo=${resolveMemoBudget(config) / 1048576}MB historyRewrite=${config?.historyRewrite === true ? 'on' : 'off'} sample=${config?.sample === true ? 'on' : 'off'}`)
 }
 
 /** 供离线自测读取的最近一次冷开时间，避免为测试导出内部状态。 */
 export function lastColdOpen() {
   return { ...coldOpen }
 }
+

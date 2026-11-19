@@ -10,8 +10,8 @@
 
 | 会话 | 日志 | 解压后 | 事件 | 全量耗时 |
 |---|---|---|---|---|
-| 54 MB 级 | 54.0 MB | 175.7 MB | 63234 | 解压 3.6 s + 解析 2.4 s + 冻结 0.24 s |
-| 36 MB 级 | 36.1 MB | 129.6 MB | 44380 | 解压 2.3 s + 解析 1.8 s |
+| 会话 B | 54.0 MB | 175.7 MB | 63234 | 解压 3.6 s + 解析 2.4 s + 冻结 0.24 s |
+| 会话 C | 36.1 MB | 129.6 MB | 44380 | 解压 2.3 s + 解析 1.8 s |
 
 这段时间里主线程被连续同步工作占住，所以首屏要等好几秒，**发送和终止按钮也一起点不动**。
 
@@ -28,6 +28,39 @@ zstd 帧是独立可解码的（带 checksum），而帧边界只需纯结构扫
    凑够若干条消息就停；首帧的完整性由结构扫描验证，切在半帧上会自动跳过；
 3. 丢弃原实现那份等价 opening（同一个尾部 cursor），只转发它排队中的增量事件。
 
+没有预热、没有额外后台任务、不缓存任何跨请求状态。
+
+## 解码缓存扩容（memo-budget）
+
+首屏快路径解决的是「多久能看到内容」，但**「多久能开始干活」**取决于宿主的完整解码，
+那一步仍然要 2~4 秒。而宿主把解码结果缓存在 `coldLogMemo` 里，容量写死为
+`COLD_LOG_MEMO_MAX_ENTRIES = 2`——两个位置，用户在第三个长会话上一跳，
+第一个就被挤掉，切回来又要重新解码。
+
+实测（2026-11-20，本机）：
+
+| 场景 | 宿主原样（2 条） | 扩容后（1500 MB） |
+|---|---|---|
+| A→B→C→D→E 依次首开 | 4374 / 3555 / 2687 / 2560 / 2267 ms | 4748 / 5851 / 3830 / 3163 / 3253 ms |
+| 再依次开第二遍 | A 7ms、B **3329ms**、C **2687ms** 被挤出 | A 9 / B 7 / C 8 / D 7 / E 7 ms |
+| 命中率 | 2/5 | **5/5** |
+
+CPU profile（开 4 个最大会话，采样 19219 ms）说明命中的时候省掉了什么：
+
+```
+consumeEventLine   7726ms  40.2%     解压帧       2957ms  15.4%
+GC                 1464ms   7.6%     深冻结       1144ms   6.0%
+utf8Slice          1049ms   5.5%     v4 行校验     243ms   1.3%
+```
+
+每条的驻留堆约 4.6 KB/事件（实测 `heapUsed` 差值：61.4 MB/78557 事件 → +357 MB）。
+
+实现只替换 `memoizeStoredLog` 的淘汰策略，字节预算 + LRU；不改事件内容、不做额外校验，
+也不改变 `revision` 比对——文件一变宿主照旧不复用。堆压力兜底：插入后若 `heapUsed`
+超过高水位（默认 3000 MB）立即回收到半预算。
+
+配置：`memoBudgetMb`（默认 1500）、`memoHeapHighWaterMb`（默认 3000）。
+
 ## 命中条件
 
 只有**同时满足**才走快路径，否则完全透传原实现：
@@ -37,7 +70,7 @@ zstd 帧是独立可解码的（带 checksum），而帧边界只需纯结构扫
 - `sessionPersistence.stat(id)` 有当前格式代的 `.jsonl.zstd` 产物；
 - 尾部解析得到**连续**且 seq 合法的窗口（任何一步不符就退回）。
 
-## 首屏契约
+## 首屏契约（已逐条核对客户端代码）
 
 | 客户端要求 | 出处 | 满足方式 |
 |---|---|---|
@@ -51,24 +84,74 @@ zstd 帧是独立可解码的（带 checksum），而帧边界只需纯结构扫
 
 ## 首屏裁剪
 
-窗口里两个字段对首屏渲染无用，实测占 65% 体积：
+窗口里有几类字段对首屏渲染无用，删掉不影响任何显示：
 
-| 字段 | 占比 | 为什么能删 |
-|---|---|---|
-| `assistant/message.data.stream` | 37% | 客户端只有 trajectory 取 `firstTokenTime`；置 `[]` 后该函数返回 `undefined`，调用处有 `??` 兜底 |
-| `request/header.data.header.tools` | 29% | 只在「请求详情」面板用；消费方写的是 `Array.isArray(rawTools) ? rawTools : []` |
+| 字段 | 为什么能删 |
+|---|---|
+| `assistant/message.data.stream` | 客户端只有 trajectory 取 `firstTokenTime`；置 `[]` 后该函数返回 `undefined`，调用处有 `??` 兜底 |
+| `request/header.data.header.tools` | 只在「请求详情」面板用；消费方写的是 `Array.isArray(rawTools) ? rawTools : []` |
+| `job/registered` / `job/settled` 的 `label` | 是工具命令原文，同一轮的 `tool/call.arguments` 已逐字带着它 |
+| 同上 `owner` | 恒等于本会话 id，由 header 即可推出 |
 
-`tool/call` 参数和 `tool/result` 正文**全部保留**——那些是展开后才看、丢了无法复原的内容。
+`job/*` 事件在客户端**没有任何渲染节点**：全仓库 19 个引用它的文件里，只有
+`dsh-api-session-controller` 的已知类型白名单提到这两个类型，`dsh-client-ui-chat`
+的 13 个节点定义里一个都没有。
 
-## 窗口按消息边界截断
+实测 8 个最大会话（每个 20 条消息的尾部窗口）：
 
-**这是个容易踩的坑**：`collectWindow` 从尾部往前逐帧收集，凑够 `maxMessages` 就 `break`。
-但对**小于初始窗口（4 MB）的文件**，第一次读就把整份日志读进了缓冲区，
-之后只解一帧就满足条件退出——如果直接返回 `collected` 全部内容，
-`maxMessages` 参数就完全没生效。
+| 会话（压缩后大小） | 事件 | 原始 | 裁剪后 | 压缩率 |
+|---|---|---|---|---|
+| 会话 A（61.4 MB） | 159 | 261 KB | 129 KB | 49.4% |
+| 会话 B（57.9 MB） | 120 | 380 KB | 137 KB | 36.1% |
+| 会话 C（43.8 MB） | 132 | 206 KB | 108 KB | 52.4% |
+| 会话 D（41.0 MB） | 116 | 396 KB | 181 KB | 45.7% |
+| 会话 E（28.8 MB） | 77 | 114 KB | 68 KB | 59.6% |
+| 会话 F（25.2 MB） | 163 | 429 KB | 331 KB | 77.2% |
+| 会话 G（22.3 MB） | 111 | 308 KB | 88 KB | 28.6% |
+| 会话 H（20.0 MB） | 104 | 127 KB | 63 KB | 49.6% |
+| **合计** | — | **2221 KB** | **1105 KB** | **50.2%** |
 
-实测一个 3.1 MB / 4292 事件的会话，`n=1/2/3` 都返回 4292 个事件、7.4 MB payload。
-修复后在尾部按消息边界 `slice`，同样的会话降到 **19 KB**（缩小 385 倍）。
+其中 `job.label` 单独贡献：6 个大会话合计 75 KB / 950 KB（7.9%）。
+
+裁剪生效性验证（103 个 job 事件 + 89 个 tool/result + 90 个 tool/call）：
+
+| 检查 | 结果 |
+|---|---|
+| `job.label` 残留 | 0 |
+| `job.owner` 残留 | 0 |
+| `tool/result.content` 保留 | 89 / 89 |
+| `tool/call.arguments` 保留 | 89 / 90（1 个本身是空串） |
+| `tool/ptc-dispatch.arguments` 保留 | 43 / 43 |
+
+### 折叠详情为什么不能裁
+
+工具调用在首屏是**折叠行**，但折叠行本身要显示内容，而那内容就是从这些字段算出来的。
+`dsh-client-ui-tool` 的摘要函数：
+
+```js
+function deriveSummary(variant, argsRaw) {
+  const parsed = parseArgs(argsRaw)                 // JSON.parse(call.argsRaw)
+  if (variant === 'search' && Array.isArray(args.queries)) ...
+  const picked = pickString(args, SUMMARY_KEYS[variant])
+  if (picked !== undefined) return firstLine(picked)
+  for (const v of Object.values(args)) if (typeof v === 'string' && v !== '') return firstLine(v)
+  return firstLine(argsRaw)                        // 兜底也读原文
+}
+```
+
+`tool/result` 同理由 `block.content` 取折叠行右侧的摘要。所以裁掉它们不是"少加载了
+用不到的东西"，而是把折叠行变成空白。
+
+更关键的是**没有第二份副本可以补**：本插件为了省掉重复解码，把宿主那份完整 opening
+丢弃了（见上文第 3 步），尾部窗口就是客户端拿到的唯一数据。裁了之后展开工具卡片
+永远是空的，滚动到那一屏也不会自愈。
+
+### 试过但放弃的两个优化
+
+| 想法 | 为什么放弃 |
+|---|---|
+| `arguments` 字符串池化（`tool/call` 与 `assistant/message` 内嵌的那份逐字相同，实测 67 个调用 0 处不同） | 只省内存驻留，不省快照字节：序列化时两处都要展开成完整字符串，客户端收到的一样多。而快照本来只有 100~300 KB |
+| 只保留摘要所需键 | 实测 114 个 `tool/call` 的 `arguments` 共 141 KB，只留摘要键仍要 139 KB（省 1.6%）——摘要的兜底逻辑会退回读原文 |
 
 ## 热开窗口与滑动加载
 
@@ -76,17 +159,29 @@ zstd 帧是独立可解码的（带 checksum），而帧边界只需纯结构扫
 
 **膨胀的主因是 `minTurns: 2`**，不是 500：它要求「至少凑满两整轮」，
 而大会话单轮就有 300+ 事件，所以 500 这个硬预算根本没机会生效。
-实测把 maxMessages 从 500 降到 60 几乎没用。
+实测把 maxMessages 从 500 降到 60 几乎没用：
+
+| 会话 | 500/2轮 | 500/1轮 | 60/无turn窗 |
+|---|---|---|---|
+| 会话 B | 327 事件 / 1.31 MB | 327 / 1.31 | 345 / 1.37 |
+| 会话 A | 749 事件 / 1.68 MB | 749 / 1.68 | **430 / 0.90** |
+| 会话 C | 637 事件 / 1.20 MB | 630 / 1.18 | **355 / 0.66** |
 
 所以插件对**热开**也接管：去掉 `turnWindow`、把 `maxMessages` 收到上限。
-配合上面的首屏裁剪，最终体积降到原本的 35~50%。
+配合上面的首屏裁剪，最终体积：
+
+| 会话 | 改前 | 改后（cap=100 + 裁剪） |
+|---|---|---|
+| 会话 B | 1.31 MB | **0.91 MB** |
+| 会话 A | 1.68 MB | **0.83 MB** |
+| 会话 C | 1.20 MB | **0.60 MB** |
 
 `hasMore` 仍由 `paginate` 如实返回，客户端滚到顶部照常触发 `loadOlder`
 往前补一页——这就是滑动窗口，不需要改客户端。
 
 ## 消除全量深拷贝（shared load）
 
-一次性 CPU 采样（`stopCost` 仅 102 ms）抓到的最大热点不是磁盘、不是解压，而是：
+一次性采样（`stopCost` 仅 102 ms）抓到的最大热点不是磁盘、不是解压，而是：
 
 ```
 structuredClone @ node:internal/worker/js_transferable:25267ms
@@ -119,61 +214,40 @@ events: session.snapshotEvents().map((event) => structuredClone(event))
 
 `lib/fast-load.js` 替换 `SessionCorpus.prototype.load`：
 只有**全部事件与 header 都已冻结**时才共享引用，任何一个没冻结就原样退回原实现。
-
-`lib/query-fast.js` 再做三件相关的事：
-
-- `readSession` 里那次结果被直接丢弃的 `Session.create`（实测 3087 ms）去掉；
-- `readSession` 的事件映射改为逐事件判断：已冻结共享、未冻结走 `snapshotSessionEvent`
-  （实测省 2529 ms，`cloned=0`）；
-- `persistence.list` 加 15 秒 TTL 缓存（扫约 1000 个会话单次 800 ms~19 s），
-  先 `throwIfAborted` 再查缓存，取消语义不变。
-
-## 首屏预缓存
-
-冷开时 `stat` 之后还要读文件尾部（实测 `read=100~1004 ms`）。
-那部分只依赖文件内容，可以在空闲时先算好。
-
-范围：**只排除 `origin: 'subagent'`**，不排除 `parentSession`——
-带 `parentSession` 且 `isSeeded: true` 的是 **fork 出来的会话**，
-它会出现在侧栏、能被点开，是正常会话。
-
-实测 836 个会话里 730 个是 subagent，剩下 106 个中 35 个未归档，
-预热这 35 个**总占用 430 KB**、单条平均构建 21 ms。
-
-`lib/prefetch.js` 要点：
-
-| 项 | 做法 |
-|---|---|
-| 缓存键 | `size:mtime:ino`，文件一变立刻作废 |
-| 单条上限 | 256 KB，超大条目跳过（避免一条挤掉全部预算） |
-| 内存预算 | 4 MB，超出按 LRU 淘汰 |
-| 延迟 | 启动后 30 秒开始，避开高峰 |
-| 让出 | 每处理 1 个会话 `await` 一次 |
-
-命中后首屏降到 **17~18 ms**（只剩 `stat` 的 16 ms）。
+命中/退回次数每 60 秒输出一次 `FASTLOAD hits=N coldFallback=M`。
 
 ## 已知限制
 
 - **投影值要等完整读取跑完才到**（`todos` / `plan` / `inbox` / `goal` 等 key 会短暂读 `undefined`）；
 - 窗口起点不做 `turn/start` 对齐（冷热一致），可能从一轮对话中间开始显示，
   往上滚一屏即自动补齐；
-- 原实现的全量读取仍会发生（省的是**首屏等待**与尾部读的 I/O，不是总 I/O）；
-- 完整解码（解压 + parse + 校验）插件碰不到：`readZstdPrefix` 依赖
-  `createZstdFrameDecoder` / `SessionLogScanner` / `assertZstdHeaderFrame` 三个模块私有实现。
+- 原实现的全量读取仍会发生（省的是**首屏等待**与尾部读的 I/O，不是总 I/O）。
 
 ## 诊断埋点
 
-所有埋点只读，写进 `$DSH_HOME/session-firstpaint.log`
-（内存缓冲 + 250 ms 批量落盘，不在关键路径做同步 I/O）。
+插件装了三组只读埋点，用来定位「打开慢 / 点击卡」，都写进
+`$DSH_HOME/session-firstpaint.log`（内存缓冲 + 250 ms 批量落盘，不在关键路径做同步 I/O）。
 
 | 埋点 | 输出行 | 回答什么问题 |
 |---|---|---|
-| 冷开首屏 | `BEGIN` / `HIT` / `HIT-CACHED` / `EMIT` / `OPENING` | 首屏花了多久、读了多少字节、缓存是否命中 |
+| 冷开首屏 | `BEGIN` / `HIT` / `EMIT` / `OPENING` | 首屏到底花了多久、读了多少字节 |
 | 热开窗口 | `WARM` / `WARM-OPEN` | 窗口是否被收窄、热开首帧多快 |
-| 主线程卡顿 | `STALL` / `GC` | 卡了多久、是不是 GC 造成的 |
-| 冷读分段 | `PROFILE-OPEN` / `PROFILE-READ` | 解码 / 读文件 / 校验各占多少 |
-| 查询层 | `READSESSION` / `LIST-SESSIONS` / `QUERY` | 谁在反复读会话、列表扫了多少 |
-| 预缓存 | `PREFETCH begin/done` | 预热目标数、成功数、占用 |
+| 主线程卡顿 | `LAG` | 卡了多久、卡在冷开后的第几毫秒 |
+| 冷读分段 | `PROFILE` | 读文件 / 解压+parse / 校验+冻结 各占多少 |
+| GC 归因 | `GCS` | 卡顿是不是垃圾回收造成的 |
+
+`PROFILE` 用替换 `readStoredLog` / `decodeStoredLog` / `readZstdPrefix`
+三个 prototype 方法实现，靠相减得到中间各段耗时，不需要读任何内部实现：
+
+```
+read            = total − decode
+validate+freeze = decode − unzip+parse
+```
+
+`GCS` 行的 `topGc` 给出最慢的几次 GC（时刻:类型:耗时），
+`topStall` 给出最长的几次主线程阻塞。两者时间轴对齐就能判断卡顿归属。
+
+阈值默认 200 ms（`PROFILE`）/ 300 ms，可通过配置调整。
 
 ## 配置
 
@@ -181,12 +255,53 @@ events: session.snapshotEvents().map((event) => structuredClone(event))
 - id: session-firstpaint
   name: dsh-session-firstpaint
   config:
-    maxMessages: 100          # 冷开与热开共用的消息上限，默认 50
-    prefetchMessages: 2       # 每条预缓存快照保留的消息数，默认 2
-    prefetchBudgetKb: 4096    # 预缓存内存上限，默认 4096 KB
-    prefetchDelayMs: 30000    # 启动后延迟多久预热，默认 30 秒
-    profileThresholdMs: 200   # 冷读超过多少毫秒才记 PROFILE，默认 200
+    # 冷开与热开共用的消息上限
+    maxMessages: 20
+    # 解码缓存字节预算与堆压力高水位（见「解码缓存扩容」）
+    memoBudgetMb: 1500
+    memoHeapHighWaterMb: 3000
+    # 翻历史页：只计时不改包（改写会与客户端的锚点策略冲突，见下）
+    historyPageEvents: 300
+    historyRewrite: false
+    # 首屏预缓存：目标消息数、内存上限、启动后延迟
+    prefetchMessages: 5
+    prefetchBudgetKb: 4096
+    prefetchDelayMs: 30000
+    # 诊断阈值
+    profileThresholdMs: 200
+    stallThresholdMs: 120
+    gcThresholdMs: 150
+    # 一次性 CPU 采样（默认关闭）
+    sample: false
+    sampleWindowMs: 60000
+    sampleIntervalUs: 10000
 ```
+
+## 翻历史为什么不改写回包
+
+早期版本会对 `loadOlder` 那一页做两处改写：把 `turnWindow.minTurns` 收到 1，
+并在页超过 `historyPageEvents` 时从尾部收紧到最近的 `turn/start`。
+
+这在**用户正在滚动**的场景会跳页。客户端的 `ChatViewport.historyConsumption()`：
+
+```js
+if (this.historyScrolling.size === 0) return scroller.scrollTop <= .5 ? 'prepend' : 'preserve'
+...
+return scroller.scrollTop <= .5 ? 'prepend' : 'native'      // 用户正在滚 + overflow-anchor 可用
+```
+
+`native` 分支**不做任何锚点补偿**，完全交给浏览器 `overflow-anchor`；而同一文件的
+`createFlowMotion` 在滚动动效激活时会把 `overflowAnchor` 置成 `none`：
+
+```js
+createFlowMotion(..., active => {
+  if (this.elements !== null) this.elements.scroller.style.overflowAnchor = active ? 'none' : ''
+})
+```
+
+两者叠加时，改回包事件条数就没有任何东西维持视觉位置，表现为上翻跳页。
+所以 `historyRewrite` 默认 `false`，只保留 `HISTORY-COST`（每页耗时/体积）与
+`HISTORY-PAGE`（收窄统计）两组计时。
 
 ## 停用与还原
 
@@ -202,6 +317,11 @@ events: session.snapshotEvents().map((event) => structuredClone(event))
 所以 `PATCHED` 存的是**还原函数本身**：新装载先调用它摘掉旧包装，
 还原时还会核对 `proto.follow` 是否仍是自己装的那个，避免迟到的 cleanup 摘掉新补丁。
 
+`memo-budget` 的定位也做了同样的防御：它不按名字静态猜原型链，而是以
+`open` 所在的原型为主锚点（`profile.js` 用同一条路径稳定命中），依次尝试
+`open` 原型 → 其上层 → 全链 → 实例自身，并在失败时把整条原型链写进日志
+（`MEMOBUDGET-SKIP ... chain=...`），下一版不用再猜。命中时日志会带 `via=open-proto`。
+
 ## 自测
 
 ```sh
@@ -209,20 +329,21 @@ node test.mjs
 ```
 
 八个用例覆盖：冷会话命中、已 attach 透传、无产物退回、还原后原型恢复、
-子代理地址不拦截、配置传入 + 首屏裁剪字段、冷开记录、热开窗口收窄。
+子代理地址不拦截、配置传入 + 首屏裁剪字段、冷开记录不被热开覆盖、
+热开窗口收敛到上限。
 测试用 `node:zlib` 现场造带 checksum 的同格式日志，不读写任何真实会话。
 
 ## 实测数据
 
-| 会话大小 | 文件 | 尾部读字节 | 首屏事件 | 耗时 |
+| 会话 | 文件 | 尾部读字节 | 首屏事件 | 耗时 |
 |---|---|---|---|---|
-| 55 MB 级 | 55.0 MB | **4.00 MB** | 295 | 131 ms |
-| 61 MB 级 | 61.4 MB | **4.00 MB** | 345 | 67 ms |
-| 37 MB 级 | 37.2 MB | **4.00 MB** | 334 | 84 ms |
-| 31 MB 级 | 31.7 MB | **4.00 MB** | — | 86 ms |
-| 27 MB 级 | 27.4 MB | **4.00 MB** | — | 97 ms |
+| 会话 B | 55.0 MB | **4.00 MB** | 295 | 131 ms |
+| 会话 A | 61.4 MB | **4.00 MB** | 345 | 67 ms |
+| 会话 C | 37.2 MB | **4.00 MB** | 334 | 84 ms |
+| 会话 D | 31.7 MB | **4.00 MB** | — | 86 ms |
+| 会话 E | 27.4 MB | **4.00 MB** | — | 97 ms |
 
 合计磁盘读 **20.0 MB vs 整份读 212.6 MB，省 91%**。
 
 线上首屏（诊断日志实测）：`firstpaint=114–120 ms`（对照：完整读取约 4–6 s）。
-加预缓存后：`HIT-CACHED stat=16ms total=16ms`，即 **17~18 ms**。
+
